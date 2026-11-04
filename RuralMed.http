@@ -1,0 +1,6 @@
+@RuralMed_HostAddress = http://localhost:5022
+
+GET {{RuralMed_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
