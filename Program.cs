@@ -24,6 +24,10 @@ MapCrud<MedicalRecord>(app, store, "historiales", h =>
     !store.Exists<Patient>("pacientes", h.PacienteId) ? "El paciente no existe" :
     !store.Exists<Doctor>("medicos", h.MedicoId) ? "El medico no existe" :
     string.IsNullOrWhiteSpace(h.Diagnostico) ? "Diagnostico es obligatorio" : null);
+// Datos exclusivamente ficticios. Se insertan solo cuando las cuatro colecciones están vacías.
+// Deshabilitar con DEMO_SEED=false. No usar este backend con pacientes reales.
+if (!string.Equals(Environment.GetEnvironmentVariable("DEMO_SEED"), "false", StringComparison.OrdinalIgnoreCase))
+    DemoSeeder.SeedIfEmpty(store);
 app.Run();
 
 static void MapCrud<T>(WebApplication app, DemoStore store, string name, Func<T, string?> validate) where T : Entity
