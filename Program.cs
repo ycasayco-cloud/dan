@@ -1,86 +1,102 @@
-using FirebaseAdmin;
-using FirebaseAdmin.Auth;
-using Google.Apis.Auth.OAuth2;
-using Google.Cloud.Firestore;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
-var projectId = Environment.GetEnvironmentVariable("FIREBASE_PROJECT_ID") ?? throw new Exception("Configure FIREBASE_PROJECT_ID");
-var credentialJson = Environment.GetEnvironmentVariable("FIREBASE_SERVICE_ACCOUNT_JSON") ?? throw new Exception("Configure FIREBASE_SERVICE_ACCOUNT_JSON");
-var credential = GoogleCredential.FromJson(credentialJson);
-FirebaseApp.Create(new AppOptions { Credential = credential, ProjectId = projectId });
-var firestore = new FirestoreDbBuilder { ProjectId = projectId, Credential = credential }.Build();
-builder.Services.AddSingleton(firestore);
-builder.Services.AddCors(o => o.AddPolicy("frontend", p => p.WithOrigins((Environment.GetEnvironmentVariable("FRONTEND_ORIGINS") ?? "http://localhost:5500").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).AllowAnyHeader().AllowAnyMethod()));
+builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+builder.Services.AddCors(o => o.AddPolicy("demo", p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 var app = builder.Build();
-app.UseHttpsRedirection();
-app.UseCors("frontend");
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+app.UseCors("demo");
 
-// Each authenticated request is checked with Firebase Auth; authorization roles are read only from Firestore.
-async Task<(string? uid, string? role)> Identity(HttpRequest request) {
-    var auth = request.Headers.Authorization.ToString();
-    if (!auth.StartsWith("Bearer ")) return (null, null);
-    try {
-        var token = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(auth[7..], true);
-        var doc = await firestore.Collection("users").Document(token.Uid).GetSnapshotAsync();
-        var role = doc.Exists && doc.TryGetValue<string>("role", out var r) ? r : "patient";
-        return (token.Uid, role);
-    } catch { return (null, null); }
-}
-app.MapPost("/api/profile", async (HttpRequest request, ProfileInput input) => {
-    var (uid, role) = await Identity(request);
-    if (uid is null) return Results.Unauthorized();
-    var doc = firestore.Collection("users").Document(uid);
-    var existing = await doc.GetSnapshotAsync();
-    if (existing.Exists) return Results.Conflict(new { error = "Profile already exists" });
-    await doc.CreateAsync(new { displayName = input.DisplayName.Trim(), role = "patient", createdAt = Timestamp.GetCurrentTimestamp() });
-    return Results.Ok(new { uid, role = "patient" });
-});
-app.MapGet("/api/me", async (HttpRequest request) => {
-    var (uid, role) = await Identity(request);
-    if (uid is null) return Results.Unauthorized();
-    return Results.Ok(new { uid, role });
-});
-app.MapPost("/api/appointments", async (HttpRequest request, AppointmentInput input) => {
-    var (uid, role) = await Identity(request);
-    if (uid is null) return Results.Unauthorized();
-    if (role != "patient") return Results.Forbid();
-    if (input.DateUtc <= DateTime.UtcNow || input.DateUtc > DateTime.UtcNow.AddMonths(12)) return Results.BadRequest(new { error = "Invalid date" });
-    if (string.IsNullOrWhiteSpace(input.Reason) || input.Reason.Length > 300) return Results.BadRequest(new { error = "Reason must be 1–300 characters" });
-    var doc = await firestore.Collection("appointments").AddAsync(new Dictionary<string, object> {
-      ["patientId"] = uid, ["doctorId"] = "", ["dateUtc"] = Timestamp.FromDateTime(input.DateUtc.ToUniversalTime()),
-      ["reason"] = input.Reason.Trim(), ["status"] = "requested", ["createdAt"] = Timestamp.GetCurrentTimestamp()
-    });
-    return Results.Created($"/api/appointments/{doc.Id}", new { id = doc.Id });
-});
-app.MapGet("/api/appointments", async (HttpRequest request) => {
-    var (uid, role) = await Identity(request);
-    if (uid is null) return Results.Unauthorized();
-    if (role is not ("patient" or "doctor")) return Results.Forbid();
-    var field = role == "doctor" ? "doctorId" : "patientId";
-    var snapshot = await firestore.Collection("appointments").WhereEqualTo(field, uid).Limit(50).GetSnapshotAsync();
-    return Results.Ok(snapshot.Documents.Select(d => new { id = d.Id, patientId = d.GetValue<string>("patientId"), doctorId = d.GetValue<string>("doctorId"), reason = d.GetValue<string>("reason"), status = d.GetValue<string>("status"), dateUtc = d.GetValue<Timestamp>("dateUtc").ToDateTime() }));
-});
-app.MapPost("/api/records", async (HttpRequest request, RecordInput input) => {
-    var (uid, role) = await Identity(request);
-    if (uid is null) return Results.Unauthorized();
-    if (role != "doctor") return Results.Forbid();
-    if (string.IsNullOrWhiteSpace(input.PatientId) || string.IsNullOrWhiteSpace(input.Notes) || input.Notes.Length > 5000) return Results.BadRequest();
-    // Only a doctor assigned to a confirmed appointment with this patient may create a record.
-    var authorized = await firestore.Collection("appointments").WhereEqualTo("doctorId", uid).WhereEqualTo("patientId", input.PatientId).WhereEqualTo("status", "confirmed").Limit(1).GetSnapshotAsync();
-    if (authorized.Count == 0) return Results.Forbid();
-    var doc = await firestore.Collection("records").AddAsync(new Dictionary<string, object> { ["patientId"] = input.PatientId, ["doctorId"] = uid, ["notes"] = input.Notes.Trim(), ["createdAt"] = Timestamp.GetCurrentTimestamp() });
-    return Results.Created($"/api/records/{doc.Id}", new { id = doc.Id });
-});
-app.MapGet("/api/records", async (HttpRequest request) => {
-    var (uid, role) = await Identity(request);
-    if (uid is null) return Results.Unauthorized();
-    if (role != "patient") return Results.Forbid();
-    var snapshot = await firestore.Collection("records").WhereEqualTo("patientId", uid).Limit(50).GetSnapshotAsync();
-    return Results.Ok(snapshot.Documents.Select(d => new { id = d.Id, doctorId = d.GetValue<string>("doctorId"), notes = d.GetValue<string>("notes"), createdAt = d.GetValue<Timestamp>("createdAt").ToDateTime() }));
-});
+// Demo only: JSON storage on the container's ephemeral filesystem; no authentication.
+var store = new DemoStore(Path.Combine(AppContext.BaseDirectory, "data", "ruralmed.json"));
+app.MapGet("/", () => Results.Ok(new { service = "RuralMed API", version = "1.0", documentation = "/api", health = "/health", warning = "Solo demostracion, no usar datos reales" }));
+app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "RuralMed API" }));
+app.MapGet("/api", () => Results.Ok(new { endpoints = new[] { "/api/pacientes", "/api/medicos", "/api/citas", "/api/historiales" }, methods = new[] { "GET", "POST", "PUT", "DELETE" } }));
+
+MapCrud<Patient>(app, store, "pacientes", p => string.IsNullOrWhiteSpace(p.Nombre) || string.IsNullOrWhiteSpace(p.Documento) ? "Nombre y documento son obligatorios" : null);
+MapCrud<Doctor>(app, store, "medicos", d => string.IsNullOrWhiteSpace(d.Nombre) || string.IsNullOrWhiteSpace(d.Especialidad) ? "Nombre y especialidad son obligatorios" : null);
+MapCrud<Appointment>(app, store, "citas", c =>
+    !store.Exists<Patient>("pacientes", c.PacienteId) ? "El paciente no existe" :
+    !store.Exists<Doctor>("medicos", c.MedicoId) ? "El medico no existe" :
+    c.FechaUtc == default ? "FechaUtc es obligatoria" :
+    !new[] { "solicitada", "confirmada", "cancelada", "atendida" }.Contains(c.Estado.ToLowerInvariant()) ? "Estado invalido" : null);
+MapCrud<MedicalRecord>(app, store, "historiales", h =>
+    !store.Exists<Patient>("pacientes", h.PacienteId) ? "El paciente no existe" :
+    !store.Exists<Doctor>("medicos", h.MedicoId) ? "El medico no existe" :
+    string.IsNullOrWhiteSpace(h.Diagnostico) ? "Diagnostico es obligatorio" : null);
 app.Run();
-record ProfileInput(string DisplayName);
-record AppointmentInput(DateTime DateUtc, string Reason);
-record RecordInput(string PatientId, string Notes);
+
+static void MapCrud<T>(WebApplication app, DemoStore store, string name, Func<T, string?> validate) where T : Entity
+{
+    var route = "/api/" + name;
+    app.MapGet(route, () => Results.Ok(store.All<T>(name)));
+    app.MapGet(route + "/{id:guid}", (Guid id) => store.Get<T>(name, id) is { } item ? Results.Ok(item) : Results.NotFound(new { error = "No encontrado" }));
+    app.MapPost(route, (T item) =>
+    {
+        var error = validate(item);
+        if (error is not null) return Results.BadRequest(new { error });
+        item.Id = Guid.NewGuid();
+        store.Upsert(name, item);
+        return Results.Created($"{route}/{item.Id}", item);
+    });
+    app.MapPut(route + "/{id:guid}", (Guid id, T item) =>
+    {
+        if (!store.Exists<T>(name, id)) return Results.NotFound(new { error = "No encontrado" });
+        var error = validate(item);
+        if (error is not null) return Results.BadRequest(new { error });
+        item.Id = id;
+        store.Upsert(name, item);
+        return Results.Ok(item);
+    });
+    app.MapDelete(route + "/{id:guid}", (Guid id) =>
+    {
+        if (name == "pacientes" && (store.All<Appointment>("citas").Any(x => x.PacienteId == id) || store.All<MedicalRecord>("historiales").Any(x => x.PacienteId == id)))
+            return Results.Conflict(new { error = "Paciente vinculado a citas o historiales" });
+        if (name == "medicos" && (store.All<Appointment>("citas").Any(x => x.MedicoId == id) || store.All<MedicalRecord>("historiales").Any(x => x.MedicoId == id)))
+            return Results.Conflict(new { error = "Medico vinculado a citas o historiales" });
+        return store.Delete<T>(name, id) ? Results.NoContent() : Results.NotFound(new { error = "No encontrado" });
+    });
+}
+
+public abstract class Entity { public Guid Id { get; set; } }
+public sealed class Patient : Entity { public string Nombre { get; set; } = ""; public string Documento { get; set; } = ""; public string Telefono { get; set; } = ""; public string Comunidad { get; set; } = ""; }
+public sealed class Doctor : Entity { public string Nombre { get; set; } = ""; public string Especialidad { get; set; } = ""; public string Colegiatura { get; set; } = ""; }
+public sealed class Appointment : Entity { public Guid PacienteId { get; set; } public Guid MedicoId { get; set; } public DateTime FechaUtc { get; set; } public string Motivo { get; set; } = ""; public string Estado { get; set; } = "solicitada"; }
+public sealed class MedicalRecord : Entity { public Guid PacienteId { get; set; } public Guid MedicoId { get; set; } public string Diagnostico { get; set; } = ""; public string Tratamiento { get; set; } = ""; public DateTime FechaUtc { get; set; } = DateTime.UtcNow; }
+
+public sealed class DemoStore
+{
+    private readonly object _gate = new();
+    private readonly string _path;
+    private readonly JsonSerializerOptions _json = new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
+    private Dictionary<string, string> _tables = new();
+    public DemoStore(string path)
+    {
+        _path = path;
+        if (File.Exists(path))
+        {
+            try { _tables = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path), _json) ?? new(); }
+            catch (JsonException) { throw new InvalidOperationException("Archivo de datos JSON corrupto"); }
+        }
+    }
+    private List<T> Load<T>(string name) where T : Entity => _tables.TryGetValue(name, out var json) ? JsonSerializer.Deserialize<List<T>>(json, _json) ?? new() : new();
+    private void Save<T>(string name, List<T> list) where T : Entity
+    {
+        _tables[name] = JsonSerializer.Serialize(list, _json);
+        Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+        var temp = _path + ".tmp";
+        File.WriteAllText(temp, JsonSerializer.Serialize(_tables, _json));
+        File.Move(temp, _path, true);
+    }
+    public List<T> All<T>(string name) where T : Entity { lock (_gate) return Load<T>(name); }
+    public T? Get<T>(string name, Guid id) where T : Entity { lock (_gate) return Load<T>(name).FirstOrDefault(x => x.Id == id); }
+    public bool Exists<T>(string name, Guid id) where T : Entity { lock (_gate) return Load<T>(name).Any(x => x.Id == id); }
+    public void Upsert<T>(string name, T item) where T : Entity
+    {
+        lock (_gate) { var list = Load<T>(name); list.RemoveAll(x => x.Id == item.Id); list.Add(item); Save(name, list); }
+    }
+    public bool Delete<T>(string name, Guid id) where T : Entity
+    {
+        lock (_gate) { var list = Load<T>(name); if (list.RemoveAll(x => x.Id == id) == 0) return false; Save(name, list); return true; }
+    }
+}

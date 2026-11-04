@@ -2,12 +2,5 @@ services:
   - type: web
     name: ruralmed-api
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /health
-    envVars:
-      - key: FIREBASE_PROJECT_ID
-        sync: false
-      - key: FIREBASE_SERVICE_ACCOUNT_JSON
-        sync: false
-      - key: FRONTEND_ORIGINS
-        sync: false
